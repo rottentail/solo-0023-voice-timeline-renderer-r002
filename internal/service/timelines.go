@@ -11,8 +11,8 @@ import (
 )
 
 func (s *Service) CreateTimeline(ctx context.Context, id string, request TimelineWriteRequest) (domain.Timeline, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock := s.idMu.Lock("timeline:" + id)
+	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return domain.Timeline{}, false, err
 	}

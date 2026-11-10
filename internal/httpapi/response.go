@@ -6,8 +6,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"voice-timeline-renderer/internal/domain"
+	"voice-timeline-renderer/internal/service"
 )
 
 type errorEnvelope struct {
@@ -42,6 +44,11 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 func writeError(w http.ResponseWriter, err error, job *domain.RenderJob) {
 	appErr := domain.AsAppError(err)
 	status := statusForKind(appErr.Kind)
+	if appErr.Kind == domain.KindUnavailable {
+		// Explicitly retryable: the durable queued job can be polled or
+		// re-submitted with the same id without producing duplicate output.
+		w.Header().Set("Retry-After", strconv.Itoa(service.RetryAfterSeconds))
+	}
 	envelope := errorEnvelope{Error: appErr.Detail}
 	if job != nil && job.ID != "" {
 		envelope.Job = job
@@ -59,6 +66,8 @@ func statusForKind(kind domain.ErrorKind) int {
 		return http.StatusNotFound
 	case domain.KindTooLarge:
 		return http.StatusRequestEntityTooLarge
+	case domain.KindUnavailable:
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

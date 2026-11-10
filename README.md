@@ -13,9 +13,16 @@ The implementation covers:
 - Equal-power neighboring-span crossfades.
 - Peak normalization into a requested dBFS target.
 - Durable render states, receipts, and atomically committed output folders.
+- A bounded streaming renderer that spills mix blocks to scratch storage, so a
+  30-minute 48 kHz stereo render completes inside an explicit memory budget.
+- At least two concurrent renders through a worker pool, with short source and
+  timeline operations never blocked by long renders.
+- Explicitly retryable capacity rejection and single-use render identifiers so
+  retries never duplicate output or produce contradictory receipts.
 
-Automated tests are intentionally deferred. A later task stage will add unit,
-integration, and end-to-end verification around the production interfaces.
+Automated tests cover render byte-parity with the original in-memory algorithm,
+bounded-memory and concurrent rendering, capacity admission, idempotency, and
+crash recovery.
 
 ## Requirements
 
@@ -45,9 +52,34 @@ Runtime settings are supplied through arguments:
 
 - `-addr`: HTTP listen address, default `:8093`.
 - `-data`: persistent data root, default `./var/voice-timeline`.
+- `-max-parallel-renders`: render worker pool size, default `2`.
+- `-render-memory-mib`: total render memory budget in mebibytes, default
+  `1024`, shared across concurrent renders.
+- `-max-output-seconds`: maximum rendered timeline duration, default `1800`
+  (30 minutes).
 
 No environment variable is required. Do not put credentials in the repository;
 the service does not consume any remote credential.
+
+## Rendering, concurrency, and memory model
+
+Renders execute on a bounded worker pool rather than inline in the HTTP
+request. Each render streams its mix through a block store that keeps only a
+small set of float32 blocks resident and spills the rest to a private scratch
+file under `tmp/`. Crossfade regions are pinned while they still receive
+contributions, so the float32 arithmetic order matches a whole-buffer mixer
+exactly: the same timeline always renders byte-identical output.
+
+When the worker pool or memory budget is saturated, a new render is persisted in
+the `queued` state and the request fails with HTTP `503` and a stable
+`render_capacity_exhausted` code plus a `Retry-After` header. No output is
+published for a rejected job. Retrying the same `render_id` resumes the queued
+job; concurrent or repeated requests for one id are deduplicated, so an output
+and its receipt are produced exactly once. A job that genuinely exceeds the
+whole memory budget fails terminally with `render_memory_budget_exceeded`.
+
+Source creation and all read operations use per-identifier locking and
+lock-free file reads, so they make progress while renders are running.
 
 ## HTTP interface
 
@@ -132,7 +164,9 @@ must fit within both neighboring spans.
 The render runs through the durable states
 `queued -> rendering -> finalizing -> completed`. A failed render records a
 terminal `failed` state with a stable error code and does not expose a partial
-output folder.
+output folder. When render capacity is saturated the job is durably `queued`
+and the response is `503` with `render_capacity_exhausted` and a `Retry-After`
+header; resubmitting the same `render_id` is safe and never duplicates output.
 
 ### Read resources
 
@@ -193,10 +227,23 @@ Each check creates an isolated temporary data directory, starts the real HTTP
 handler, sends generated WAV inputs, and verifies read-back or rendered output.
 The checks are bounded and do not require network access.
 
-## Deferred test boundary
+## Tests
 
-This baseline contains no unit tests, test fixtures, browser checks, or
-`test_command`. The downstream task stage owns test creation and red/green
-verification. It should extend coverage around WAV chunk edge cases, timeline
-crossfade bounds, failed job cleanup, concurrent idempotency, and HTTP error
-mapping.
+Run the full suite from the repository root:
+
+```bash
+go test ./...
+```
+
+Notable coverage:
+
+- `internal/render` byte-parity against a reference in-memory implementation,
+  including aggressive block spilling, plus a 30-minute bounded-memory render
+  and concurrent renders.
+- `internal/service` capacity admission, single-use idempotency, parallel
+  execution, memory-budget rejection, and crash recovery.
+- `internal/httpapi` non-blocking short operations during a render and the
+  retryable `503` capacity response.
+- `internal/checkflow` end-to-end compatibility and determinism through the
+  real HTTP surface.
+

@@ -69,6 +69,13 @@ Any active state may transition to `failed`. `completed` and `failed` are
 terminal. A failed job stores a stable error code and message. A completed job
 stores the output file, output metadata, and immutable render receipt.
 
+A job that cannot start because the worker pool or memory budget is saturated
+stays durably `queued` and the request returns a retryable `unavailable`
+error (`render_capacity_exhausted`, HTTP 503 with `Retry-After`). Resubmitting
+the same render identifier resumes the queued job and never publishes a second
+output or receipt. A job whose own footprint exceeds the whole render memory
+budget fails terminally with `render_memory_budget_exceeded`.
+
 ### Render receipt
 
 A receipt records source identifiers, span placement, gain adjustments, peak
@@ -109,14 +116,20 @@ issue without persisting a partial timeline.
 Entry point: `PUT /v1/renders/{render_id}` with a `timeline_id` body field.
 
 1. The service creates a durable `queued` job.
-2. The renderer moves to `rendering` and loads all referenced sources.
-3. Each source interval is resampled to the timeline sample rate, mapped to the
+2. Admission reserves a worker slot and a bounded memory reservation; on
+   saturation the job stays `queued` and a retryable capacity error is returned.
+3. The renderer moves to `rendering` and loads referenced sources on demand,
+   keeping only a small source cache resident.
+4. Each source interval is resampled to the timeline sample rate, mapped to the
    requested channel layout, gain-adjusted, faded, and placed on the timeline.
-4. Overlapping neighboring spans are mixed with equal-power crossfade weights.
-5. The finalizing stage applies peak normalization to the requested target,
-   writes a WAV and receipt through temporary files, and renames them into
+   The mix accumulates in fixed-size float32 blocks; crossfade regions stay
+   resident while they still receive contributions, and finished blocks spill
+   to a private scratch file, so memory is independent of timeline length.
+5. Overlapping neighboring spans are mixed with equal-power crossfade weights.
+6. The finalizing stage applies peak normalization to the requested target,
+   streams a WAV and receipt through temporary files, and renames them into
    place atomically.
-6. The job moves to `completed`. Any error records a failed terminal state and
+7. The job moves to `completed`. Any error records a failed terminal state and
    removes unpublished temporary output.
 
 Success is observable through the job resource, the downloaded WAV, and the
@@ -160,10 +173,21 @@ Errors use a JSON envelope:
 ## Engineering mechanisms
 
 - State transitions: render jobs persist every active and terminal transition.
-- Error propagation: domain errors retain stable codes through HTTP responses.
-- Resource lifecycle: temporary files are cleaned after failed publication.
-- Concurrency: storage guards indexes and registry updates; unique IDs and
-  atomic renames prevent duplicate or half-visible records.
+- Error propagation: domain errors retain stable codes through HTTP responses,
+  including a dedicated retryable `unavailable` kind for capacity saturation.
+- Resource lifecycle: temporary files and per-render scratch spill files are
+  cleaned after success, failure, or abort.
+- Concurrency: renders run on a bounded worker pool with per-identifier
+  in-flight deduplication; source and timeline operations use per-ID locking
+  and lock-free reads, so short operations never wait behind a long render.
+- Memory: mixing and encoding stream through a block store that keeps a fixed
+  number of resident blocks and spills the rest to scratch storage; an
+  admission estimate enforces a configurable total render memory budget.
+- Determinism: block pinning preserves the exact float32 operation order, so
+  the same timeline renders byte-identical output regardless of spilling or
+  parallel scheduling.
+- Recovery: on startup, non-terminal jobs are re-adopted; an output folder left
+  by a crash between commit and completion is reconciled rather than duplicated.
 - Validation boundaries: request size, PCM layout, timeline bounds, and gain
   ranges are checked before allocation-heavy work.
 

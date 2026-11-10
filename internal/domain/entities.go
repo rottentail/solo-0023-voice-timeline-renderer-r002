@@ -138,3 +138,16 @@ func (job *RenderJob) Transition(to RenderState, detail *ErrorDetail, now time.T
 	job.UpdatedAt = now.UTC()
 	return nil
 }
+
+// ReAdopt moves a job left behind by an interrupted process back to rendering so
+// the deterministic pipeline can run to completion. Completed and failed jobs
+// are terminal and can never be adopted.
+func (job *RenderJob) ReAdopt(now time.Time) error {
+	if job.State == RenderCompleted || job.State == RenderFailed {
+		return E(KindConflict, "invalid_state_transition", "state", "terminal render job cannot be adopted")
+	}
+	job.State = RenderRendering
+	job.Error = nil
+	job.UpdatedAt = now.UTC()
+	return nil
+}

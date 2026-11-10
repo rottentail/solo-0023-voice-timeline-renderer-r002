@@ -1,8 +1,6 @@
 package render
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -10,32 +8,19 @@ import (
 	"voice-timeline-renderer/internal/domain"
 )
 
+// buildReceipt constructs the immutable render record from the streaming
+// results. The output metrics are measured over the quantized PCM16 samples
+// during encoding, which is exactly the values the original implementation
+// obtained by decoding the finished WAV.
 func buildReceipt(
 	renderID string,
 	plan domain.Timeline,
-	encoded []byte,
+	output domain.OutputAsset,
+	outputMetrics audiocodec.Metrics,
 	normalized normalizationResult,
 	spans []preparedSpan,
 	now time.Time,
-) (domain.RenderReceipt, domain.OutputAsset, error) {
-	decoded, info, err := audiocodec.DecodeWAV(encoded)
-	if err != nil {
-		return domain.RenderReceipt{}, domain.OutputAsset{}, err
-	}
-	measurements := audiocodec.Measure(decoded.Samples)
-	digest := sha256.Sum256(encoded)
-	digestText := hex.EncodeToString(digest[:])
-	output := domain.OutputAsset{
-		Digest:        digestText,
-		ByteCount:     int64(len(encoded)),
-		SampleRate:    info.SampleRate,
-		Channels:      info.Channels,
-		BitsPerSample: info.BitsPerSample,
-		FrameCount:    info.FrameCount,
-		DurationMS:    framesToMilliseconds(info.FrameCount, info.SampleRate),
-		PeakDBFS:      measurements.PeakDBFS,
-		RMSDBFS:       measurements.RMSDBFS,
-	}
+) domain.RenderReceipt {
 	receiptSpans := make([]domain.ReceiptSpan, 0, len(spans))
 	warnings := make([]string, 0)
 	for _, span := range spans {
@@ -65,13 +50,13 @@ func buildReceipt(
 			RequestedPeakDBFS: plan.TargetPeakDBFS,
 			BeforePeakDBFS:    normalized.Before.PeakDBFS,
 			AppliedGainDB:     normalized.GainDB,
-			OutputPeakDBFS:    measurements.PeakDBFS,
+			OutputPeakDBFS:    outputMetrics.PeakDBFS,
 		},
 		Spans:     receiptSpans,
 		Warnings:  warnings,
 		CreatedAt: now.UTC(),
 	}
-	return receipt, output, nil
+	return receipt
 }
 
 func framesToMilliseconds(frames int64, sampleRate int) int64 {

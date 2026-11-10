@@ -13,8 +13,8 @@ import (
 )
 
 func (s *Service) CreateSource(ctx context.Context, id string, request SourceWriteRequest) (domain.SourceAsset, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock := s.idMu.Lock("source:" + id)
+	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return domain.SourceAsset{}, false, err
 	}

@@ -7,48 +7,28 @@ import (
 )
 
 type normalizationResult struct {
-	Before  audiocodec.Metrics
-	After   audiocodec.Metrics
-	GainDB  float64
-	Samples []float32
+	Before audiocodec.Metrics
+	GainDB float64
+	gain   float64
 }
 
-func normalizePeak(samples []float32, targetDBFS float64) normalizationResult {
-	before := audiocodec.Measure(samples)
+// planNormalization computes the single deterministic peak-normalization gain
+// from the raw pre-mix linear peak, exactly matching the original normalizePeak
+// path which divided the target by the measured linear peak. Applying the gain
+// lazily during encoding produces the same float32 values without a second
+// full-size sample buffer.
+func planNormalization(before audiocodec.Metrics, peakLinear float64, targetDBFS float64) normalizationResult {
 	target := audiocodec.DBToLinear(targetDBFS)
-	peaks := beforePeak(samples)
 	gain := 1.0
-	if peaks > 0 {
-		gain = target / peaks
+	if peakLinear > 0 {
+		gain = target / peakLinear
 	}
 	if math.IsNaN(gain) || math.IsInf(gain, 0) || gain <= 0 {
 		gain = 1
 	}
-	for index, sample := range samples {
-		value := float64(sample) * gain
-		if value > 1 {
-			value = 1
-		}
-		if value < -1 {
-			value = -1
-		}
-		samples[index] = float32(value)
-	}
 	return normalizationResult{
-		Before:  before,
-		After:   audiocodec.Measure(samples),
-		GainDB:  audiocodec.LinearToDB(gain),
-		Samples: samples,
+		Before: before,
+		GainDB: audiocodec.LinearToDB(gain),
+		gain:   gain,
 	}
-}
-
-func beforePeak(samples []float32) float64 {
-	peak := 0.0
-	for _, sample := range samples {
-		value := math.Abs(float64(sample))
-		if value > peak {
-			peak = value
-		}
-	}
-	return peak
 }

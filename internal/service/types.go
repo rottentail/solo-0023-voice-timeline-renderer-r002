@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"runtime/debug"
 	"sync"
 
 	"voice-timeline-renderer/internal/domain"
+	"voice-timeline-renderer/internal/render"
 )
 
 type Repository interface {
@@ -15,28 +17,55 @@ type Repository interface {
 	GetTimeline(string) (domain.Timeline, error)
 	SaveJob(domain.RenderJob) error
 	GetJob(string) (domain.RenderJob, error)
-	CommitRenderArtifacts(string, []byte, domain.RenderReceipt) error
+	ListJobIDs() ([]string, error)
+	NewRenderSink(renderID string) render.Sink
+	ScratchDir() string
 	GetRenderOutput(string) ([]byte, domain.RenderReceipt, error)
 }
 
+// Config controls the bounded render path. The defaults guarantee two parallel
+// renders inside an explicit memory budget while keeping short operations
+// independent of long-running renders.
 type Config struct {
-	MaxSourceBytes  int64
-	MaxSpans        int
-	MaxOutputFrames int64
+	MaxSourceBytes     int64
+	MaxSpans           int
+	MaxOutputFrames    int64
+	MaxParallelRenders int
+	RenderMemoryBytes  int64
+	BlockFrames        int64
+	ResidentBlocks     int
 }
 
+// DefaultConfig raises the output cap to thirty minutes at 48 kHz and reserves
+// a one-gibibyte render memory budget shared by up to two concurrent renders.
 func DefaultConfig() Config {
 	return Config{
-		MaxSourceBytes:  32 << 20,
-		MaxSpans:        64,
-		MaxOutputFrames: 48000 * 180,
+		MaxSourceBytes:     32 << 20,
+		MaxSpans:           64,
+		MaxOutputFrames:    48000 * 1800,
+		MaxParallelRenders: 2,
+		RenderMemoryBytes:  1 << 30,
+		BlockFrames:        render.DefaultBlockFrames,
+		ResidentBlocks:     render.DefaultResidentBlocks,
 	}
 }
 
 type Service struct {
 	repo   Repository
 	config Config
-	mu     sync.Mutex
+
+	// idMu serializes create-or-get decisions per resource identifier while
+	// never spanning the heavy render work.
+	idMu keyedMutex
+
+	// render admission: a counting semaphore plus a live reservation total.
+	renderSlots chan struct{}
+	admitMu     sync.Mutex
+	reserved    int64
+
+	// inFlight dedupes concurrent PUTs for the same render id so a retried
+	// request cannot start a second pipeline or publish twice.
+	inFlight flightMap
 }
 
 func New(repo Repository, config Config) *Service {
@@ -50,7 +79,28 @@ func New(repo Repository, config Config) *Service {
 	if config.MaxOutputFrames <= 0 {
 		config.MaxOutputFrames = defaults.MaxOutputFrames
 	}
-	return &Service{repo: repo, config: config}
+	if config.MaxParallelRenders <= 0 {
+		config.MaxParallelRenders = defaults.MaxParallelRenders
+	}
+	if config.RenderMemoryBytes <= 0 {
+		config.RenderMemoryBytes = defaults.RenderMemoryBytes
+	}
+	if config.BlockFrames <= 0 {
+		config.BlockFrames = defaults.BlockFrames
+	}
+	if config.ResidentBlocks <= 0 {
+		config.ResidentBlocks = defaults.ResidentBlocks
+	}
+	svc := &Service{
+		repo:        repo,
+		config:      config,
+		renderSlots: make(chan struct{}, config.MaxParallelRenders),
+	}
+	// Keep the Go runtime from exceeding the explicit render budget under
+	// transient garbage; the block store itself guarantees a hard cap.
+	debug.SetMemoryLimit(config.RenderMemoryBytes + (256 << 20))
+	debug.SetGCPercent(50)
+	return svc
 }
 
 type SourceWriteRequest struct {
@@ -68,11 +118,6 @@ type TimelineWriteRequest struct {
 
 type RenderWriteRequest struct {
 	TimelineID string `json:"timeline_id"`
-}
-
-type RenderResult struct {
-	Job domain.RenderJob
-	WAV []byte
 }
 
 func (s *Service) GetSource(ctx context.Context, id string) (domain.SourceAsset, error) {

@@ -10,22 +10,29 @@ import (
 	"voice-timeline-renderer/internal/domain"
 )
 
+// SaveSource stages the source folder outside the lock and only holds the
+// repository lock for the final existence check and atomic rename. Media
+// streaming therefore never blocks concurrent reads.
 func (repo *Repository) SaveSource(asset domain.SourceAsset, wav []byte) error {
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
-
 	final := repo.path("sources", asset.ID)
-	if _, err := os.Stat(final); err == nil {
+	repo.mu.RLock()
+	_, statErr := os.Stat(final)
+	repo.mu.RUnlock()
+	if statErr == nil {
 		return domain.E(domain.KindConflict, "source_conflict", "source_id", "source identifier already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect source destination", err)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect source destination", statErr)
 	}
+
 	temp, err := os.MkdirTemp(repo.path("tmp"), "source-*")
 	if err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot create source staging directory", err)
 	}
+	committed := false
 	defer func() {
-		_ = os.RemoveAll(temp)
+		if !committed {
+			_ = os.RemoveAll(temp)
+		}
 	}()
 	if err := writeBytes(filepath.Join(temp, "source.wav"), wav, 0o640); err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot write source media", err)
@@ -33,18 +40,29 @@ func (repo *Repository) SaveSource(asset domain.SourceAsset, wav []byte) error {
 	if err := writeJSONAtomic(filepath.Join(temp, "metadata.json"), asset, 0o640); err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot write source metadata", err)
 	}
+
+	repo.mu.Lock()
+	if _, err := os.Stat(final); err == nil {
+		repo.mu.Unlock()
+		return domain.E(domain.KindConflict, "source_conflict", "source_id", "source identifier already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		repo.mu.Unlock()
+		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect source destination", err)
+	}
 	if err := os.Rename(temp, final); err != nil {
+		repo.mu.Unlock()
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot commit source", err)
 	}
 	if err := syncDirectory(repo.path("sources")); err != nil {
+		repo.mu.Unlock()
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot sync source index", err)
 	}
+	repo.mu.Unlock()
+	committed = true
 	return nil
 }
 
 func (repo *Repository) GetSourceMeta(id string) (domain.SourceAsset, error) {
-	repo.mu.RLock()
-	defer repo.mu.RUnlock()
 	var asset domain.SourceAsset
 	if err := readJSON(repo.path("sources", id, "metadata.json"), &asset); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -60,9 +78,7 @@ func (repo *Repository) GetSource(id string) (domain.SourceAsset, []byte, error)
 	if err != nil {
 		return domain.SourceAsset{}, nil, err
 	}
-	repo.mu.RLock()
 	payload, readErr := os.ReadFile(repo.path("sources", id, "source.wav"))
-	repo.mu.RUnlock()
 	if readErr != nil {
 		if errors.Is(readErr, os.ErrNotExist) {
 			return domain.SourceAsset{}, nil, domain.E(domain.KindNotFound, "source_not_found", "source_id", "source media does not exist")
